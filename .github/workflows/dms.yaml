@@ -1,0 +1,92 @@
+name: Dead Man's Switch
+
+permissions:
+  contents: write
+
+env:
+  HEARTBEAT_INTERVAL: 336 # in hours, 2 weeks
+  NUMBER_OF_WARNINGS: 2   # number of warnings before final action
+  ARMED: "false"
+
+on:
+  schedule:
+    - cron: '0 9 * * *'   # Run daily at 09:00 UTC
+  workflow_dispatch:
+    inputs:
+      heartbeat_interval:
+        description: 'Heartbeat interval in hours'
+        required: false
+      number_of_warnings:
+        description: 'Number of warnings before final action'
+        required: false
+      armed:
+        description: 'Set to true to arm the switch, false for testing'
+        required: false
+
+jobs:
+  run-dms:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+    
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13.5"
+      
+      - name: Set Git user identity
+        run: |
+          git config --global user.email "dms@bot.github.com"
+          git config --global user.name "dms_bot"
+      
+      - name: Set up Git credentials
+        run: |
+          git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}
+
+      - name: Set all variables and secrets as environment variables
+        env:
+          ALL_VARS: ${{ toJson(vars) }}
+          ALL_SECRETS: ${{ toJson(secrets) }}
+        run: |
+          # Parse and export all variables
+          echo "Setting up variables..."
+          echo "$ALL_VARS" | jq -r 'to_entries[] | "\(.key)=\(.value)"' >> $GITHUB_ENV
+          
+          # Parse and export all secrets
+          echo "Setting up secrets..."
+          echo "$ALL_SECRETS" | jq -r 'to_entries[] | "\(.key)=\(.value)"' >> $GITHUB_ENV
+          
+          echo "✅ All variables and secrets have been exported to environment"
+
+      - name: Run Dead Man's Switch
+        run: |
+          WORKFLOW_INPUT_HEARTBEAT_INTERVAL="${{ inputs.heartbeat_interval }}"
+          WORKFLOW_INPUT_NUMBER_OF_WARNINGS="${{ inputs.number_of_warnings }}"
+          WORKFLOW_INPUT_ARMED="${{ inputs.armed }}"
+          
+          # Use input if provided, else check environment variables (with or without INPUT_ prefix), else fall back to DEFAULT
+          HEARTBEAT_INTERVAL_ARG="${WORKFLOW_INPUT_HEARTBEAT_INTERVAL:-${HEARTBEAT_INTERVAL}}"
+          NUMBER_OF_WARNINGS_ARG="${WORKFLOW_INPUT_NUMBER_OF_WARNINGS:-${NUMBER_OF_WARNINGS}}"
+          ARMED_ARG="${WORKFLOW_INPUT_ARMED:-${ARMED}}"
+
+          echo "🔧 Using HEARTBEAT_INTERVAL=$HEARTBEAT_INTERVAL_ARG"
+          echo "⚠️  Using NUMBER_OF_WARNINGS=$NUMBER_OF_WARNINGS_ARG"
+          echo "🛡️  Armed: $ARMED_ARG"
+
+          # Build command arguments
+          ARGS="$HEARTBEAT_INTERVAL_ARG $NUMBER_OF_WARNINGS_ARG"
+          
+          if [ "$ARMED_ARG" = "true" ]; then
+            ARGS="$ARGS --armed"
+          fi
+          
+          # Add --manual-dispatch if triggered manually
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            ARGS="$ARGS --manual-dispatch"
+            echo "🔄 Manual dispatch detected - adding --manual-dispatch flag"
+          fi
+
+          echo "🚀 Running: python3 dead_mans_switch.py $ARGS"
+          python3 dead_mans_switch.py $ARGS
