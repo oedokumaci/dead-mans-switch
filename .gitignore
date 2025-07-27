@@ -1,0 +1,28 @@
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# MacOS
+**/.DS_Store
+
+# VSCode
+.vscode/
+
+# Jekyll and Ruby build files
+_site/
+.bundle/
+vendor/
+Gemfile.lock
+.sass-cache/
+.jekyll-cache/
+.jekyll-metadata
