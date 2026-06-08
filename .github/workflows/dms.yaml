@@ -3,6 +3,15 @@ name: Dead Man's Switch
 permissions:
   contents: write
 
+# Serialize runs of this workflow. The daily cron and a workflow_dispatch
+# can otherwise overlap and race on _get_remaining_warnings: the manual
+# run might read state before cron writes the warning commit, see ALIVE,
+# and silently exit while cron correctly advances. `cancel-in-progress:
+# false` prevents an in-flight run from being killed mid-send.
+concurrency:
+  group: dead-mans-switch
+  cancel-in-progress: false
+
 env:
   HEARTBEAT_INTERVAL: 336 # in hours, 2 weeks
   NUMBER_OF_WARNINGS: 2   # number of warnings before final action
@@ -22,71 +31,125 @@ on:
       armed:
         description: 'Set to true to arm the switch, false for testing'
         required: false
+        type: choice
+        options:
+          - 'false'
+          - 'true'
 
 jobs:
   run-dms:
     runs-on: ubuntu-22.04
+    # GitHub's default job timeout is 360 minutes. A hung SMTP handshake
+    # or a stuck `git push` could burn through that and hold the
+    # concurrency lock for hours. 15 minutes is plenty for a real run
+    # (~30s end-to-end) and bounds the damage from a half-open socket.
+    timeout-minutes: 15
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-    
+        with:
+          # Full history is required so the script can walk back through
+          # prior warning/passed-away commits. With the default shallow
+          # clone (depth 1), warnings beyond the latest commit are invisible.
+          fetch-depth: 0
+          persist-credentials: false
+
       - name: Set up Python 3.13
         uses: actions/setup-python@v5
         with:
-          python-version: "3.13.5"
-      
-      - name: Set Git user identity
-        run: |
-          git config --global user.email "dms@bot.github.com"
-          git config --global user.name "dms_bot"
-      
-      - name: Set up Git credentials
-        run: |
-          git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}
+          # Pin to a minor version, not a patch — patch releases age out of
+          # the runner cache and pinning forces slow re-downloads.
+          python-version: "3.13"
 
-      - name: Set all variables and secrets as environment variables
+      - name: Configure git remote with workflow token
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO}"
+
+      - name: Export user-defined vars and secrets to environment
         env:
           ALL_VARS: ${{ toJson(vars) }}
           ALL_SECRETS: ${{ toJson(secrets) }}
         run: |
-          # Parse and export all variables
-          echo "Setting up variables..."
-          echo "$ALL_VARS" | jq -r 'to_entries[] | "\(.key)=\(.value)"' >> $GITHUB_ENV
-          
-          # Parse and export all secrets
-          echo "Setting up secrets..."
-          echo "$ALL_SECRETS" | jq -r 'to_entries[] | "\(.key)=\(.value)"' >> $GITHUB_ENV
-          
-          echo "✅ All variables and secrets have been exported to environment"
+          set -euo pipefail
+          # Names that would shadow critical runner state if a user
+          # accidentally (or maliciously) named a repo variable/secret the
+          # same thing.
+          RESERVED='^(PATH|HOME|USER|SHELL|PWD|TMPDIR|LD_PRELOAD|LD_LIBRARY_PATH|PYTHONPATH|IFS|BASH_ENV|ENV|SHELLOPTS|BASHOPTS|PROMPT_COMMAND|GITHUB_.+|RUNNER_.+|ACTIONS_.+|CI)$'
+
+          export_one () {
+            local kind=$1 json=$2
+            # Encode each value as base64 so multi-line values (PGP keys,
+            # multi-paragraph secrets) and values containing any special
+            # character (newline, '=', NUL, etc.) survive intact. The line
+            # format is `<key> <base64-of-value>`, which is unambiguous and
+            # safe for `while read`.
+            local key encoded
+            while IFS=' ' read -r key encoded; do
+              if [[ "$key" =~ $RESERVED ]]; then
+                echo "::warning::Refusing to export ${kind} '$key' — name collides with a reserved env var."
+                continue
+              fi
+              local value delim
+              value=$(printf '%s' "$encoded" | base64 -d)
+              # Heredoc form so multi-line decoded values land in $GITHUB_ENV
+              # without breaking the KEY=VALUE format. Random delimiter so
+              # an embedded literal `EOF` in the value can't terminate it.
+              delim="EOF_$(openssl rand -hex 8)"
+              {
+                printf '%s<<%s\n' "$key" "$delim"
+                printf '%s\n' "$value"
+                printf '%s\n' "$delim"
+              } >> "$GITHUB_ENV"
+            # `(. // {})` guards against the empty-vars case — GitHub
+            # renders `toJson(vars)` as the literal `null` (not `{}`) when
+            # no repo variables are defined, and `null | to_entries` errors
+            # under `set -euo pipefail`, aborting the workflow on the
+            # brand-new user's first run.
+            done < <(jq -r '(. // {}) | to_entries[] | .key + " " + (.value | @base64)' <<<"$json")
+          }
+
+          export_one variable "$ALL_VARS"
+          export_one secret   "$ALL_SECRETS"
 
       - name: Run Dead Man's Switch
+        env:
+          INPUT_INTERVAL: ${{ inputs.heartbeat_interval }}
+          INPUT_WARNINGS: ${{ inputs.number_of_warnings }}
+          INPUT_ARMED: ${{ inputs.armed }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
-          WORKFLOW_INPUT_HEARTBEAT_INTERVAL="${{ inputs.heartbeat_interval }}"
-          WORKFLOW_INPUT_NUMBER_OF_WARNINGS="${{ inputs.number_of_warnings }}"
-          WORKFLOW_INPUT_ARMED="${{ inputs.armed }}"
-          
-          # Use input if provided, else check environment variables (with or without INPUT_ prefix), else fall back to DEFAULT
-          HEARTBEAT_INTERVAL_ARG="${WORKFLOW_INPUT_HEARTBEAT_INTERVAL:-${HEARTBEAT_INTERVAL}}"
-          NUMBER_OF_WARNINGS_ARG="${WORKFLOW_INPUT_NUMBER_OF_WARNINGS:-${NUMBER_OF_WARNINGS}}"
-          ARMED_ARG="${WORKFLOW_INPUT_ARMED:-${ARMED}}"
+          set -euo pipefail
+          HEARTBEAT_INTERVAL_ARG="${INPUT_INTERVAL:-${HEARTBEAT_INTERVAL}}"
+          NUMBER_OF_WARNINGS_ARG="${INPUT_WARNINGS:-${NUMBER_OF_WARNINGS}}"
+          ARMED_ARG="${INPUT_ARMED:-${ARMED}}"
 
-          echo "🔧 Using HEARTBEAT_INTERVAL=$HEARTBEAT_INTERVAL_ARG"
-          echo "⚠️  Using NUMBER_OF_WARNINGS=$NUMBER_OF_WARNINGS_ARG"
-          echo "🛡️  Armed: $ARMED_ARG"
+          # Strict boolean parsing — anything other than the literal "true"
+          # or "false" fails the run loudly rather than silently disarming.
+          case "$ARMED_ARG" in
+            true)
+              ARMED_FLAG="--armed"
+              ;;
+            false|"")
+              ARMED_FLAG=""
+              ;;
+            *)
+              echo "::error::ARMED value '$ARMED_ARG' is not 'true' or 'false' — refusing to run."
+              exit 1
+              ;;
+          esac
 
-          # Build command arguments
-          ARGS="$HEARTBEAT_INTERVAL_ARG $NUMBER_OF_WARNINGS_ARG"
-          
-          if [ "$ARMED_ARG" = "true" ]; then
-            ARGS="$ARGS --armed"
+          ARGS=("$HEARTBEAT_INTERVAL_ARG" "$NUMBER_OF_WARNINGS_ARG")
+          [ -n "$ARMED_FLAG" ] && ARGS+=("$ARMED_FLAG")
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            ARGS+=("--manual-dispatch")
+            echo "::notice::Manual dispatch — switch state will not advance."
           fi
-          
-          # Add --manual-dispatch if triggered manually
-          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
-            ARGS="$ARGS --manual-dispatch"
-            echo "🔄 Manual dispatch detected - adding --manual-dispatch flag"
-          fi
 
-          echo "🚀 Running: python3 dead_mans_switch.py $ARGS"
-          python3 dead_mans_switch.py $ARGS
+          echo "Running: python3 dead_mans_switch.py ${ARGS[*]}"
+          python3 dead_mans_switch.py "${ARGS[@]}"

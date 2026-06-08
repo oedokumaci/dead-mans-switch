@@ -1,0 +1,44 @@
+[project]
+name = "dead-mans-switch"
+version = "0.1.0"
+description = "GitHub Actions-powered dead man's switch emailer"
+requires-python = ">=3.13"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "pyyaml>=6.0.3",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = [
+    "-v",
+    "--strict-markers",
+    "--cov=dead_mans_switch",
+    "--cov-report=term-missing",
+    "--cov-branch",
+    "--cov-fail-under=100",
+]
+markers = [
+    "bug: regression test for a previously-shipped bug. Locate quickly with `pytest -m bug`.",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["dead_mans_switch"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
+]
+partial_branches = [
+    "pragma: no branch",
+]
