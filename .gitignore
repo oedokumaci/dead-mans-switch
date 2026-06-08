@@ -18,6 +18,12 @@ __pycache__/
 # VSCode
 .vscode/
 
+# Test artifacts
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+
 # Jekyll and Ruby build files
 _site/
 .bundle/
