@@ -16,6 +16,7 @@ env:
   HEARTBEAT_INTERVAL: 336 # in hours, 2 weeks
   NUMBER_OF_WARNINGS: 2   # number of warnings before final action
   ARMED: "false"
+  CHECK_PUBLIC_ACTIVITY: "false"  # opt-in public-activity liveness; see README
 
 on:
   schedule:

@@ -182,3 +182,36 @@ class TestSchedule:
         assert "0 9 * * *" in workflow or re.search(
             r"cron:\s*['\"]?\s*\d+\s+\d+\s+\*\s+\*\s+\*", workflow
         )
+
+
+class TestLivenessFeatureWorkflowDefaults:
+    """v2.1.0 — public-activity liveness feature is opt-in. The
+    workflow-level default for CHECK_PUBLIC_ACTIVITY must be the literal
+    string "false" so the feature stays off unless the user explicitly
+    sets the repo variable."""
+
+    def test_workflow_defaults_check_public_activity_false(
+        self, workflow: str
+    ) -> None:
+        assert re.search(
+            r'CHECK_PUBLIC_ACTIVITY:\s*"false"', workflow
+        ), "workflow env block must default CHECK_PUBLIC_ACTIVITY to \"false\""
+
+    def test_gh_prefix_not_in_reserved_regex(self, workflow: str) -> None:
+        """GH_USERNAME, GH_ACTIVITY_TOKEN, BOT_AUTHOR_PATTERNS, and
+        BOT_MESSAGE_PATTERNS all need to pass through `export_one`.
+        Catches a future regression where someone adds `GH_*` (or any
+        of those names) to the RESERVED allowlist defensively."""
+        match = re.search(r"RESERVED='(\^[^']+)'", workflow)
+        assert match, "RESERVED regex must be defined in the workflow"
+        reserved_re = re.compile(match.group(1))
+        for var_name in (
+            "GH_USERNAME",
+            "GH_ACTIVITY_TOKEN",
+            "BOT_AUTHOR_PATTERNS",
+            "BOT_MESSAGE_PATTERNS",
+        ):
+            assert not reserved_re.match(var_name), (
+                f"{var_name!r} is matched by the RESERVED regex — it would "
+                "be silently refused by export_one."
+            )

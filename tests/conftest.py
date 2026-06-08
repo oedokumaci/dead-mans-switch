@@ -21,7 +21,17 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 @pytest.fixture(autouse=True)
 def isolate_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Remove environment variables that could leak between tests."""
-    for key in ("MY_EMAIL", "MY_PASSWORD"):
+    for key in (
+        "MY_EMAIL",
+        "MY_PASSWORD",
+        "CHECK_PUBLIC_ACTIVITY",
+        "GH_USERNAME",
+        "GH_ACTIVITY_TOKEN",
+        "BOT_AUTHOR_PATTERNS",
+        "BOT_MESSAGE_PATTERNS",
+        "GITHUB_REPOSITORY",
+        "GITHUB_REPOSITORY_OWNER",
+    ):
         monkeypatch.delenv(key, raising=False)
 
 
@@ -247,3 +257,82 @@ def utc(*args: int) -> datetime:
 def hours_ago(n: float) -> datetime:
     """Return a UTC datetime n hours before now."""
     return datetime.now(timezone.utc) - timedelta(hours=n)
+
+
+@dataclass
+class FakeGitHubEventsState:
+    """Records what happened to a public-events API call.
+
+    Mirrors ``FakeSMTPState``: controllable list of events that
+    ``_fetch_public_events`` will return, plus optional pre-set
+    exceptions to simulate network/HTTP failures. Also captures the
+    ``since`` cutoff passed to ``_has_recent_public_activity`` so
+    tests can assert the lookback window was clamped correctly —
+    without that, a mutation to the 30-day cap arithmetic would
+    survive every check that only inspects username/token.
+    """
+
+    events: list[dict[str, Any]] = field(default_factory=list)
+    raise_exception: BaseException | None = None
+    call_count: int = 0
+    last_username: str | None = None
+    last_token: str | None = None
+    last_since: datetime | None = None
+
+
+@pytest.fixture
+def fake_github_events(
+    monkeypatch: pytest.MonkeyPatch,
+) -> FakeGitHubEventsState:
+    """Replace ``_fetch_public_events`` AND wrap
+    ``_has_recent_public_activity`` so the test fixture also records
+    the ``since`` argument that the wrapper computed."""
+    import dead_mans_switch as dms
+
+    state = FakeGitHubEventsState()
+
+    def fake_fetch(username: str, token: str | None, timeout: float = 10) -> list[dict[str, Any]]:
+        state.call_count += 1
+        state.last_username = username
+        state.last_token = token
+        if state.raise_exception is not None:
+            raise state.raise_exception
+        return state.events
+
+    original = dms._has_recent_public_activity
+
+    def spy(*, since: datetime, **kwargs: Any) -> bool:
+        state.last_since = since
+        return original(since=since, **kwargs)
+
+    monkeypatch.setattr(dms, "_fetch_public_events", fake_fetch)
+    monkeypatch.setattr(dms, "_has_recent_public_activity", spy)
+    return state
+
+
+def gh_event(
+    *,
+    event_type: str = "PushEvent",
+    login: str = "alice",
+    repo_name: str = "alice/somewhere-else",
+    created_at: datetime | str | None = None,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build a realistic GitHub event dict for tests.
+
+    Keeping the schema in one helper means a future API field rename
+    is a single-line fix, not 20.
+    """
+    if created_at is None:
+        created_at = datetime.now(timezone.utc)
+    if isinstance(created_at, datetime):
+        created_at_str = created_at.isoformat().replace("+00:00", "Z")
+    else:
+        created_at_str = created_at
+    return {
+        "type": event_type,
+        "actor": {"login": login},
+        "repo": {"name": repo_name},
+        "created_at": created_at_str,
+        "payload": payload or {},
+    }

@@ -274,9 +274,228 @@ already-accrued warnings and could re-fire PASSED_AWAY within a single
 cron *without* going through the warning ladder again. Dropping every
 bot commit (step 2 above) is the only safe reset.
 
+> **Note on the public-activity feature:** if you keep
+> `CHECK_PUBLIC_ACTIVITY=true` after resetting, remember that the
+> override looks back over a period during which you may have been
+> unusually quiet (mourning, hospital, vacation). Don't rely on it
+> as your sole liveness signal in the first heartbeat cycle after
+> reset — push the heartbeat from step 4 promptly.
+
 ### Armed vs Test Mode
 - **Test Mode (`ARMED=false`):** Sends emails to you only for testing
 - **Armed Mode (`ARMED=true`):** Sends emails to recipients if you are inactive for the amount of time you specify in `HEARTBEAT_INTERVAL` in combination with `NUMBER_OF_WARNINGS`.
+
+### Optional: public-GitHub-activity fallback (v2.1+)
+
+Opt-in, off by default. If your commits-to-this-repo cadence is
+patchy but you're active on **other** GitHub repos, you can have
+the switch consult your public activity feed before advancing
+state. See [GitHub activity as fallback liveness signal](#-optional-github-activity-as-fallback-liveness-signal) for setup, limitations, and threat model.
+
+## 🔍 Optional: GitHub activity as fallback liveness signal
+
+By default the switch only watches commits in *this* repo. If you commit
+frequently to **other** repos but rarely to this one, you can opt in to
+have the switch also check your public GitHub activity before advancing
+state. When enabled, an interval-passed heartbeat is "rescued" for one
+more cycle if your public activity feed shows non-bot events since the
+window started. The feature is **off by default**; turning it on accepts
+the trade-offs documented in the threat model below.
+
+### Setup
+
+1. **Create a fine-grained Personal Access Token.** GitHub docs:
+   https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens
+   - **Where:** GitHub → your avatar → *Settings* → *Developer
+     settings* → *Personal access tokens* → *Fine-grained tokens* →
+     *Generate new token*.
+   - **Token name:** anything (e.g. `dead-mans-switch`).
+   - **Expiration:** **1 year** (use *Custom* if you need exactly
+     365 days). The feature fails closed when the token expires —
+     you just lose this signal, no other harm. **Do NOT pick "No
+     expiration"**: a leaked non-expiring PAT is a forever
+     credential.
+   - **Resource owner:** yourself.
+   - **Repository access:** *Public Repositories (read-only)* is
+     fine — the endpoint we hit is the public events feed.
+   - **Permissions:** **leave every checkbox under "Repository
+     permissions" and "Account permissions" at *No access*.** The
+     token only proves you are you; the endpoint reads publicly
+     available data.
+   - Click **Generate token** and copy the value.
+2. Add the token as a **repo secret** named `GH_ACTIVITY_TOKEN`.
+   - **Where:** repo → *Settings* → *Secrets and variables* →
+     *Actions* → *Secrets* tab → *New repository secret*.
+   - Paste **without trailing whitespace, newlines, or quotes** —
+     the script rejects malformed tokens at startup with a clear
+     error in the Actions log.
+3. Add a **repo variable** named `CHECK_PUBLIC_ACTIVITY` with the
+   value `true` (lowercase, no quotes, no spaces).
+   - **Where:** same screen as step 2, but the *Variables* tab.
+   - Strict-parsed: `"yes"`, `"1"`, `"TRUE"`, `" true "` all fail
+     loudly at startup.
+4. (Optional) Repo variable `GH_USERNAME` — only set this if your
+   personal GitHub handle differs from the **owner of this repo**
+   (e.g. if you've transferred the repo into a GitHub
+   organization). **Triple-check the spelling**: a typo here
+   silently queries someone else's account, and the switch never
+   fires. If `GH_USERNAME` differs from `GITHUB_REPOSITORY_OWNER`,
+   the workflow emits a `::notice::` on **every cron and every
+   manual dispatch** — so you can verify immediately by running the
+   workflow manually (the API call itself is short-circuited on
+   manual dispatch, but the validation notices still fire).
+   - **Org-owned repos:** you **must** set `GH_USERNAME` to your
+     personal handle. Otherwise the feature queries the org's
+     event stream, which is unrelated to your activity.
+5. (Optional) Repo variable `BOT_AUTHOR_PATTERNS` — newline-
+   separated regexes for bot **GitHub logins** beyond the built-in
+   `[bot]` suffix (so `dependabot[bot]`, `github-actions[bot]`,
+   etc. are already filtered for free). Example value:
+   ```
+   ^renovate$
+   ^github-actions$
+   ```
+6. (Optional) Repo variable `BOT_MESSAGE_PATTERNS` — newline-
+   separated regexes that match against PR/issue/comment/review/
+   release text. Each pattern runs against at most 4 KB of text
+   per field (ReDoS defense). Example value:
+   ```
+   ^chore\(deps\):
+   ^Bump .* from .* to .*$
+   ```
+
+### Verify your setup
+
+After step 6, go to *Actions* → *Dead Man's Switch* → *Run
+workflow* (leave inputs at defaults). Manual dispatch does NOT call
+`api.github.com` (by design — see *Hard limitations* below), but
+the constructor still runs every other validation. Look at the run
+log for:
+
+- a `::notice::GH_USERNAME ... differs from
+  GITHUB_REPOSITORY_OWNER ...` line (if you set `GH_USERNAME`),
+- a startup failure with `Invalid regex in BOT_AUTHOR_PATTERNS`
+  (if your regex is malformed),
+- a startup failure with `GH_ACTIVITY_TOKEN contains whitespace,
+  newlines, or non-base64-safe characters` (if you pasted the
+  token with stray whitespace),
+- a startup failure with `CHECK_PUBLIC_ACTIVITY must be 'true',
+  'false', or empty` (if you set it to `yes`/`1`/`TRUE`).
+
+If the run is green and none of those notices appear, your
+configuration is valid — wait for the next scheduled cron (default:
+09:00 UTC daily) for the first real events-feed query.
+
+### What gets checked
+
+`PushEvent`, `PullRequestEvent`, `PullRequestReviewEvent`,
+`PullRequestReviewCommentEvent`, `IssueCommentEvent`, `IssuesEvent`,
+`CreateEvent`, `DeleteEvent`, `ReleaseEvent`, `CommitCommentEvent`,
+`GollumEvent`, `MemberEvent`, `PublicEvent`, `DiscussionEvent`,
+`DiscussionCommentEvent`. Watching/starring/forking is ignored — too
+passive to count as "still alive".
+
+### Recommended interval
+
+The GitHub events feed returns at most **30 days** of activity. If
+your `HEARTBEAT_INTERVAL` is ≤ 720h (30 days), the feature can fully
+extend the heartbeat window. If you set a longer interval, the
+feature is silently capped at 30 days — the workflow log emits a
+`::notice::` you'll see in the Actions tab.
+
+### Hard limitations
+
+- **30-day / 300-event API ceiling.** The events feed returns at
+  most 30 days of activity and at most 300 events. Heartbeat
+  intervals longer than 30 days are silently clamped to 30 days
+  (with a `::notice::`).
+- **30 events per page, no pagination.** The feed reads only the
+  most recent 30 events. If you maintain many repos and Dependabot/
+  Renovate churn produces >30 bot events in the most recent slice
+  of your activity, your human events can fall off the page. Tight
+  `BOT_AUTHOR_PATTERNS` won't help (the events are already in the
+  30 we received); rely on commit-only liveness in that case.
+- **~5-minute events-feed lag.** GitHub documents the events API as
+  eventually consistent. A cron firing minutes after a real commit
+  elsewhere may still see an empty feed and advance state. One
+  missed cycle costs one warning commit; recovery is automatic on
+  the next cron.
+- **Org-owned repos.** `GITHUB_REPOSITORY_OWNER` is the **org**
+  login, not yours. **You must set `GH_USERNAME`** to your personal
+  handle, otherwise the feature queries the org's activity stream
+  (which is usually near-empty).
+- **GitHub Enterprise Server is unsupported.** `api.github.com` is
+  hardcoded; GHES would require routing to `${GITHUB_API_URL}`.
+- **Account renamed?** Update `GH_USERNAME` immediately. A rename
+  without an update silently degrades to commit-only liveness — the
+  old handle 404s, fail-closed fires, no email alert.
+- **Bot filtering uses actor identity only.** As of GitHub's
+  2025-10-07 API change, PushEvents no longer expose per-commit
+  author/message data — message-pattern filtering only meaningfully
+  applies to PR/issue/comment/review/release events.
+- **Backup mirrors with auto-pushing `dms_bot` are unsupported.**
+  See the *Threat model addition* below.
+- **Self-hosted runners with corporate TLS interception:** if your
+  runner uses a custom CA bundle, set `SSL_CERT_FILE` accordingly.
+  The script does not disable TLS verification.
+- **Manual dispatch does NOT call the API** (state-safe verification
+  only — no rate-limit burn on every "test" click). All *startup*
+  validation still runs, so manual dispatch is the right way to
+  verify your variables before the first scheduled cron — see
+  *Verify your setup* above.
+- **Long override streaks hide SMTP credential rot.** When the
+  override rescues the switch every cycle, the warning handler's
+  pre-flight SMTP login never runs. A rotated App Password or
+  revoked 2FA only surfaces at PASSED_AWAY. If you've been on an
+  override streak for a long time, manually run the workflow with
+  `armed=false` to exercise the test-mode SMTP path.
+- **Failure mode:** if the API is unreachable or your token expires,
+  the switch silently falls back to commit-only liveness. **You are
+  responsible for rotating the PAT before it expires** — there are no
+  email reminders.
+
+### Privacy notice
+
+Enabling this feature makes the workflow query `api.github.com` for
+your public activity (already world-readable data). Two practical
+notes:
+
+- The PAT lives in your repo secrets — keep the repo private.
+- **Self-hosted runners**: the PAT in your `Authorization` header
+  reaches GitHub from your runner's IP. GitHub-side logs will link
+  your runner IP to your token. For maximum privacy, leave
+  `CHECK_PUBLIC_ACTIVITY=false` and rely on commit-only liveness.
+
+### Threat model addition
+
+This feature **makes the switch rely on GitHub's API being right
+about you.** If GitHub's events feed says you were active when you
+weren't (API bug, MITM on the runner's egress, account compromise),
+the switch treats you as alive and never fires. Treat this feature
+as **defense in depth** — it can keep you alive when you've been
+quiet in *this* repo but active elsewhere; it should not be your
+sole liveness signal.
+
+Your `BOT_AUTHOR_PATTERNS` / `BOT_MESSAGE_PATTERNS` are also part of
+the security perimeter. A too-permissive filter could classify your
+own human activity as bot noise and let the switch fire while you're
+alive. A too-restrictive filter could let a Dependabot PR merge mask
+real inactivity. **Defaults lean toward over-firing**: if in doubt,
+leave the patterns empty.
+
+**Backup mirrors are NOT supported by the existing filter knobs.**
+The built-in self-exclusion only covers the current repo
+(`$GITHUB_REPOSITORY`). If you maintain a backup mirror where
+`dms_bot` auto-pushes the same warning commits, the mirror's
+PushEvents look identical to genuine activity on the events feed —
+they're tagged with **your** GitHub username (`actor.login`), not
+with the commit author. `BOT_AUTHOR_PATTERNS` matches the GitHub
+username (the events feed exposes no commit-author info beyond the
+2025-10-07 PushEvent change), so adding `dms_bot` to it has no
+effect. If you run a backup mirror, either keep
+`CHECK_PUBLIC_ACTIVITY=false`, or accept that the override may rescue
+the switch from the mirror's auto-push rather than from genuine
+activity.
 
 ## 🔧 Email Setup Guide
 
@@ -353,7 +572,7 @@ graph TD
 
 ### 🔒 **Maximum Privacy**
 - **Private Repository:** Your configuration stays confidential
-- **No External Services:** Everything runs on GitHub's infrastructure
+- **No External Services (by default):** Everything runs on GitHub's infrastructure. The one exception is the opt-in public-activity feature — when `CHECK_PUBLIC_ACTIVITY=true`, the workflow makes a single authenticated GET to `api.github.com/users/<you>/events/public` per run.
 - **Self-Hosted Option:** Run on your own GitHub Actions runner for ultimate privacy
 - **No Data Collection:** We don't see or store anything
 

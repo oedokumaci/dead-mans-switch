@@ -20,6 +20,8 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import http.client
+import json
 import math
 import os
 import re
@@ -27,15 +29,17 @@ import smtplib
 import subprocess
 import time
 import traceback
+import urllib.error
+import urllib.request
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from enum import StrEnum
 from pathlib import Path
 from types import TracebackType
-from typing import TypedDict
+from typing import Any, TypedDict
 
 
 # The bot's commit author identity. Any commit with this %an value is treated
@@ -43,6 +47,66 @@ from typing import TypedDict
 # with any other author are treated as owner heartbeats.
 BOT_USERNAME = "dms_bot"
 BOT_EMAIL = "dms@bot.github.com"
+
+# --- Public-activity liveness signal (opt-in, v2.1.0) ---
+# See docs/PLAN_liveness.md for the full design rationale.
+
+GITHUB_API_BASE = "https://api.github.com"
+EVENTS_API_TIMEOUT_SECONDS = 10
+# GitHub's events feed is capped at 30 days / 300 events; longer
+# heartbeat intervals are silently clamped to this floor.
+EVENTS_API_MAX_DAYS = 30
+# GitHub returns 403 to unset/empty User-Agent — set it explicitly.
+EVENTS_API_USER_AGENT = "dead-mans-switch"
+
+# Max bytes of any single string passed to user-regex `.search()`.
+# Defends against ReDoS (catastrophic backtracking) on long PR/issue
+# bodies. 4 KB fits any real bot signature (which appear in the first
+# few hundred chars) without exposing the regex engine to a 1 MB body.
+REGEX_INPUT_MAX_BYTES = 4096
+
+# Token-shape sanity check — rejects whitespace/CRLF in pasted secrets,
+# mirroring the MY_EMAIL injection check.
+TOKEN_SHAPE_RE = re.compile(r"^[A-Za-z0-9_]+$")
+
+# Known-bot identity convention: actors whose login ends with this
+# suffix (e.g. `dependabot[bot]`) are always classified as bots.
+KNOWN_BOT_LOGIN_SUFFIX = "[bot]"
+
+# Event types that count as liveness. Passive events
+# (WatchEvent/ForkEvent) are deliberately excluded.
+LIVENESS_EVENT_TYPES = frozenset({
+    "PushEvent",
+    "PullRequestEvent",
+    "PullRequestReviewEvent",
+    "PullRequestReviewCommentEvent",
+    "IssueCommentEvent",
+    "IssuesEvent",
+    "CreateEvent",
+    "DeleteEvent",
+    "ReleaseEvent",
+    "CommitCommentEvent",
+    "GollumEvent",
+    "MemberEvent",
+    "PublicEvent",
+    "DiscussionEvent",
+    "DiscussionCommentEvent",
+})
+
+# Paths inside `event["payload"]` to walk when checking
+# BOT_MESSAGE_PATTERNS. The 2025-10-07 PushEvent change removed
+# `payload.commits`, so PushEvent has NO text field for message-pattern
+# matching and passes through this filter unchanged.
+MESSAGE_PATTERN_PAYLOAD_PATHS = (
+    ("pull_request", "title"),
+    ("pull_request", "body"),
+    ("issue", "title"),
+    ("issue", "body"),
+    ("comment", "body"),
+    ("review", "body"),
+    ("release", "name"),
+    ("release", "body"),
+)
 
 # ASCII Unit Separator (`\x1f`) for `git log --pretty=format`. Subprocess
 # argv can't carry a literal NUL, and unit-separator is a control character
@@ -292,6 +356,267 @@ def _remote_has_commit(sha: str) -> bool:
     if result.returncode != 0:
         return False
     return bool(result.stdout.strip())
+
+
+def _build_opener() -> urllib.request.OpenerDirector:
+    """Build an opener that REFUSES to follow redirects.
+
+    Python's default ``HTTPRedirectHandler`` propagates the
+    ``Authorization`` header on cross-origin redirects (unlike requests
+    or curl). A compromised redirect on ``api.github.com`` would
+    therefore exfiltrate our PAT. We refuse redirects entirely —
+    api.github.com doesn't issue them on the events endpoint in normal
+    operation, so any 3xx becomes an ``HTTPError`` and is handled by
+    the fail-closed branch in ``_has_recent_public_activity``.
+
+    ``HTTPErrorProcessor`` IS installed — without it a bare
+    ``OpenerDirector`` returns 4xx/5xx responses as successful
+    objects, breaking the fail-closed warning path (GitHub's
+    ``{"message": "..."}`` error body would parse as a dict and the
+    event loop would silently iterate over its string keys and emit
+    no warning).
+    """
+    opener = urllib.request.OpenerDirector()
+    opener.add_handler(urllib.request.HTTPSHandler())
+    # HTTPErrorProcessor inspects the response status; on >= 300 it
+    # routes via the OpenerDirector's error chain.
+    # HTTPDefaultErrorHandler is the chain's terminal handler that
+    # actually raises ``HTTPError``. Both are needed — neither alone
+    # is sufficient. ``urllib.request.build_opener()`` installs both
+    # by default; the bare ``OpenerDirector`` we use here does not.
+    opener.add_handler(urllib.request.HTTPErrorProcessor())
+    opener.add_handler(urllib.request.HTTPDefaultErrorHandler())
+    # Explicitly DO NOT add HTTPRedirectHandler. The test in
+    # tests/test_liveness.py asserts this directly so a future
+    # maintainer can't "fix" it back.
+    return opener
+
+
+def _fetch_public_events(
+    username: str,
+    token: str | None,
+    timeout: float = EVENTS_API_TIMEOUT_SECONDS,
+) -> list[dict[str, Any]]:
+    """GET ``/users/{username}/events/public``.
+
+    Single test seam for the feature. Returns the parsed JSON list.
+    Raises on HTTP error, network error, or JSON parse error — the
+    caller decides fail-closed.
+    """
+    url = f"{GITHUB_API_BASE}/users/{username}/events/public"
+    headers = {
+        "User-Agent": EVENTS_API_USER_AGENT,
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    if token:
+        # `Bearer` is the recommended scheme for fine-grained PATs.
+        headers["Authorization"] = f"Bearer {token}"
+    request = urllib.request.Request(url, headers=headers)
+    opener = _build_opener()
+    with opener.open(request, timeout=timeout) as resp:
+        data = json.loads(resp.read())
+    # Schema-drift guard: GitHub's events feed is a JSON array. If a
+    # future API change wrapped it (e.g. `{"events": [...]}`), or if
+    # an unexpected response somehow returned 200 with a dict body,
+    # we want this to fail loudly via the caller's
+    # fail-closed-on-JSONDecodeError path rather than silently
+    # iterating over the wrong shape.
+    if not isinstance(data, list):
+        raise json.JSONDecodeError(
+            "Expected a JSON list, got " + type(data).__name__, "", 0
+        )
+    return data
+
+
+def _truncate_for_regex(value: object) -> str:
+    """Coerce to str and cap length to ``REGEX_INPUT_MAX_BYTES``.
+
+    Defends against ReDoS on long PR/issue bodies. Non-string inputs
+    (None, dicts, ints) return empty string — the caller treats that
+    as "no text to scan".
+    """
+    if not isinstance(value, str):
+        return ""
+    if len(value) > REGEX_INPUT_MAX_BYTES:
+        return value[:REGEX_INPUT_MAX_BYTES]
+    return value
+
+
+def _is_bot_event(
+    event: dict[str, Any],
+    author_patterns: list[re.Pattern[str]],
+    message_patterns: list[re.Pattern[str]],
+) -> bool:
+    """True iff this event should be filtered out as bot/automation.
+
+    Over-fire principle: when uncertain (missing actor, empty login,
+    malformed payload) we classify as bot. False positives are
+    recoverable with one heartbeat commit; false negatives (real death
+    not notified) are not.
+    """
+    actor = event.get("actor")
+    if not isinstance(actor, dict):
+        return True
+    login = actor.get("login")
+    if not isinstance(login, str) or not login:
+        return True
+    if login.endswith(KNOWN_BOT_LOGIN_SUFFIX):
+        return True
+    # `login` is NOT routed through `_truncate_for_regex` — GitHub
+    # caps usernames at 39 characters at signup so the input length
+    # is bounded by the upstream contract. The 4 KB cap defends
+    # against multi-KB PR/issue bodies; login length is small enough
+    # that a pathological `BOT_AUTHOR_PATTERNS` regex would still
+    # finish within the 15-minute job timeout. The threat model is
+    # single-owner self-DoS only — the patterns are owner-supplied.
+    if any(p.search(login) for p in author_patterns):
+        return True
+    if not message_patterns:
+        return False
+    payload = event.get("payload")
+    if not isinstance(payload, dict):
+        return False
+    # Walk the documented payload paths for the relevant event types.
+    # PushEvent has no text field after the 2025-10-07 API change, so
+    # PushEvents pass through this filter unchanged on message rules.
+    for path in MESSAGE_PATTERN_PAYLOAD_PATHS:
+        node: Any = payload
+        for key in path:
+            if not isinstance(node, dict):
+                node = None
+                break
+            node = node.get(key)
+        text = _truncate_for_regex(node)
+        if text and any(p.search(text) for p in message_patterns):
+            return True
+    return False
+
+
+def _has_recent_public_activity(
+    *,
+    username: str,
+    token: str | None,
+    since: datetime,
+    dms_repo_full_name: str,
+    author_patterns: list[re.Pattern[str]],
+    message_patterns: list[re.Pattern[str]],
+) -> bool:
+    """Return True iff the user has any non-bot, non-DMS-repo public
+    event after ``since``.
+
+    Fail-closed: a network-level exception (HTTPError, URLError,
+    JSONDecodeError, TimeoutError) emits a ``::warning::`` and returns
+    False, so the caller treats the result as "no activity found" and
+    falls back to commit-only liveness.
+
+    Per-event errors (missing keys, wrong types) are caught and the
+    event is skipped — does NOT crash the loop. Filter-logic bugs
+    (e.g. a regex that raises RuntimeError) deliberately propagate.
+    """
+    try:
+        events = _fetch_public_events(username, token)
+    except (
+        urllib.error.URLError,
+        json.JSONDecodeError,
+        TimeoutError,
+        # http.client.HTTPException (BadStatusLine, IncompleteRead,
+        # …) does NOT subclass URLError — it can leak out of
+        # `h.getresponse()` on a malformed HTTP response from
+        # api.github.com. Catch it here so a wire-level glitch fails
+        # closed to commit-only liveness instead of crashing the
+        # workflow.
+        http.client.HTTPException,
+    ):
+        # Deliberately do NOT log the full exception or URL — that
+        # would be a timing oracle telling an adversary exactly when
+        # the token expired or the rate-limit kicked in.
+        print(
+            "::warning::Public activity check unavailable today; "
+            "using commit-only liveness."
+        )
+        return False
+    for event in events:
+        # The per-event try wraps ONLY the event-extraction logic
+        # (parsing fields from the GitHub-supplied dict). A bug in the
+        # filter itself (`_is_bot_event`) must propagate — see plan
+        # §2.5. If `_is_bot_event` were inside this try, a programmer
+        # error that raised one of the four caught types would be
+        # silently swallowed and the event counted as a non-bot.
+        try:
+            if not isinstance(event, dict):
+                continue
+            if event.get("type") not in LIVENESS_EVENT_TYPES:
+                continue
+            repo = event.get("repo")
+            if isinstance(repo, dict) and repo.get("name") == dms_repo_full_name:
+                continue  # the bot's own warnings don't count
+            created_at = event.get("created_at")
+            if not isinstance(created_at, str):
+                continue
+            # Python >= 3.13 parses trailing `Z` natively — do NOT add
+            # the `.replace("Z", "+00:00")` shim, it's vestigial.
+            event_time = datetime.fromisoformat(created_at)
+            if event_time < since:
+                continue
+        except (KeyError, AttributeError, TypeError, ValueError) as e:
+            event_type = (
+                event.get("type", "unknown") if isinstance(event, dict) else "unknown"
+            )
+            print(
+                f"::warning::Skipping malformed public event "
+                f"(type={event_type}): {type(e).__name__}"
+            )
+            continue
+        if _is_bot_event(event, author_patterns, message_patterns):
+            continue
+        repo_name = repo.get("name", "?") if isinstance(repo, dict) else "?"
+        print(
+            f"::notice::Public activity override: keeping ALIVE "
+            f"(latest event {event.get('type')} on {repo_name} at {created_at})"
+        )
+        return True
+    return False
+
+
+def _compile_pattern_list(raw: str, var_name: str) -> list[re.Pattern[str]]:
+    """Parse a newline-separated regex list.
+
+    Bad regex raises ``DeadMansSwitchException`` at ``DeadMansSwitch``
+    construction time, NOT lazily — matches the existing fail-loud
+    constructor behaviour (NaN interval check, etc.).
+    """
+    out: list[re.Pattern[str]] = []
+    for raw_line in raw.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            out.append(re.compile(line))
+        except re.error as e:
+            raise DeadMansSwitchException(
+                f"Invalid regex in {var_name}: {line!r}: {e}"
+            ) from e
+    return out
+
+
+def _parse_check_public_activity(raw: str) -> bool:
+    """Strict parser for the ``CHECK_PUBLIC_ACTIVITY`` env var.
+
+    Accepts only the literal strings ``"true"``, ``"false"``, and
+    ``""`` (unset). Anything else — including ``"yes"``, ``"1"``,
+    ``"TRUE"``, ``" true "`` — raises loudly. Mirrors the strict
+    YAML ``case`` parser for ``ARMED`` (defense in depth at both
+    layers).
+    """
+    if raw in ("", "false"):
+        return False
+    if raw == "true":
+        return True
+    raise DeadMansSwitchException(
+        f"CHECK_PUBLIC_ACTIVITY must be 'true', 'false', or empty; "
+        f"got {raw!r}"
+    )
 
 
 class SMTPConfig(TypedDict):
@@ -634,9 +959,58 @@ class DeadMansSwitch:
 
         self._heartbeat_interval_hours = heartbeat_interval_hours
         self._number_of_warnings = number_of_warnings
-        self._remaining_warnings = self._get_remaining_warnings(number_of_warnings)
         self._armed = armed
         self._manual_dispatch = manual_dispatch
+
+        # Public-activity liveness signal — opt-in, off by default.
+        # All validation runs BEFORE _get_remaining_warnings (the git
+        # walk below) so a bad regex / bad token / bad parser value
+        # fails fast without doing minutes of git subprocess work
+        # first. Matches the fail-loud philosophy of the NaN-interval
+        # check above. (Plan §2.10.)
+        self._check_public_activity = _parse_check_public_activity(
+            os.getenv("CHECK_PUBLIC_ACTIVITY", "false")
+        )
+        self._author_patterns = _compile_pattern_list(
+            os.getenv("BOT_AUTHOR_PATTERNS", ""), "BOT_AUTHOR_PATTERNS"
+        )
+        self._message_patterns = _compile_pattern_list(
+            os.getenv("BOT_MESSAGE_PATTERNS", ""), "BOT_MESSAGE_PATTERNS"
+        )
+        token = os.getenv("GH_ACTIVITY_TOKEN", "")
+        if (
+            self._check_public_activity
+            and token
+            and not TOKEN_SHAPE_RE.fullmatch(token)
+        ):
+            raise DeadMansSwitchException(
+                "GH_ACTIVITY_TOKEN contains whitespace, newlines, or "
+                "non-base64-safe characters. Re-paste the secret "
+                "without trailing whitespace."
+            )
+        self._activity_token = token or None
+        # A typo in GH_USERNAME silently queries someone else's
+        # account forever. Emit a NOTICE the user can spot in their
+        # first cron log when the override-username differs from the
+        # repo owner.
+        gh_username = os.getenv("GH_USERNAME", "")
+        runner_owner = os.getenv("GITHUB_REPOSITORY_OWNER", "")
+        if (
+            self._check_public_activity
+            and gh_username
+            and runner_owner
+            and gh_username != runner_owner
+        ):
+            print(
+                f"::notice::GH_USERNAME ({gh_username!r}) differs from "
+                f"GITHUB_REPOSITORY_OWNER ({runner_owner!r}). Verify "
+                "this is intentional — a typo here silently queries "
+                "the wrong account."
+            )
+        self._gh_username = gh_username or runner_owner
+
+        # Git work last — every cheap validation has already run.
+        self._remaining_warnings = self._get_remaining_warnings(number_of_warnings)
 
     @staticmethod
     def _passed_away_already_committed() -> bool:
@@ -759,10 +1133,53 @@ class DeadMansSwitch:
             or hours_since >= self._heartbeat_interval_hours
         )
         if interval_passed:
+            # Second-chance gate: only consult public activity when
+            # interval has actually passed. Manual dispatch short-
+            # circuits to keep state-verification runs deterministic
+            # and to avoid burning rate-limit on every "test" click.
+            if (
+                self._check_public_activity
+                and not self._manual_dispatch
+                and self._consult_public_activity()
+            ):
+                return State.ALIVE
             if self._remaining_warnings <= 0:
                 return State.PASSED_AWAY
             return State.ISSUE_WARNING
         return State.ALIVE
+
+    def _consult_public_activity(self) -> bool:
+        """Return True iff the owner has recent non-bot public
+        activity. Wraps ``_has_recent_public_activity`` with the
+        runtime-only concerns (username resolution, lookback cap,
+        operator-visible logging)."""
+        if not self._gh_username:
+            print(
+                "::warning::CHECK_PUBLIC_ACTIVITY=true but no "
+                "GH_USERNAME / GITHUB_REPOSITORY_OWNER is set; "
+                "skipping public-activity check."
+            )
+            return False
+        capped_hours = min(
+            self._heartbeat_interval_hours,
+            EVENTS_API_MAX_DAYS * 24,
+        )
+        if capped_hours < self._heartbeat_interval_hours:
+            print(
+                f"::notice::Heartbeat interval "
+                f"({self._heartbeat_interval_hours}h) exceeds GitHub "
+                f"events feed window ({EVENTS_API_MAX_DAYS}d). "
+                f"Looking back {capped_hours}h."
+            )
+        since = datetime.now(timezone.utc) - timedelta(hours=capped_hours)
+        return _has_recent_public_activity(
+            username=self._gh_username,
+            token=self._activity_token,
+            since=since,
+            dms_repo_full_name=os.getenv("GITHUB_REPOSITORY", ""),
+            author_patterns=self._author_patterns,
+            message_patterns=self._message_patterns,
+        )
 
     def _email_template_paths(self) -> list[Path]:
         """List every ``*.txt`` file under the emails directory.
